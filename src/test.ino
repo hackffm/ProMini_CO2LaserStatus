@@ -37,14 +37,8 @@
 #define LASER_CURRENT A0
 #define LASER_VOLTAGE A1
 
-/*
-  U8g2lib Example Overview:
-    Frame Buffer Examples: clearBuffer/sendBuffer. Fast, but may not work with all Arduino boards because of RAM consumption
-    Page Buffer Examples: firstPage/nextPage. Less RAM usage, should work with all Arduino boards.
-    U8x8 Text Only Example: No RAM usage, direct communication with display controller. No graphics, 8x8 Text only.
-    
-  This is a page buffer example.    
-*/
+
+// We are using the smaller picture loop page buffer, otherwise the RAM gets full and the MCU crashes
 
 // Please UNCOMMENT one of the contructor lines below
 // U8g2 Contructor List (Picture Loop Page Buffer)
@@ -53,9 +47,6 @@
 //U8G2_NULL u8g2(U8G2_R0);	// null device, a 8x8 pixel display which does nothing
 //U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 //U8G2_SSD1306_128X64_ALT0_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);   // same as the NONAME variant, but may solve the "every 2nd line skipped" problem
-//U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ 13, /* data=*/ 11, /* reset=*/ 8);
-//U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ SCL, /* data=*/ SDA, /* reset=*/ U8X8_PIN_NONE);   // All Boards without Reset of the Display
-//U8G2_SSD1306_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, /* clock=*/ 16, /* data=*/ 17, /* reset=*/ U8X8_PIN_NONE);   // ESP32 Thing, pure SW emulated I2C
 //U8G2_SSD1306_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE, /* clock=*/ 16, /* data=*/ 17);   // ESP32 Thing, HW I2C with pin remapping
 U8G2_SH1106_128X64_NONAME_1_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 //U8G2_SH1106_128X64_NONAME_1_SW_I2C u8g2(U8G2_R0, A5, A4, /* reset=*/ U8X8_PIN_NONE);
@@ -86,26 +77,31 @@ float laser_kV = 0.0;
 float laser_mA = 0.0; 
 
 void setup(void) {
+  // Init serial out and ports
   Serial.begin(115200);
   Serial.println(F("Reset."));
   pinMode(TACHO_PUMP, INPUT_PULLUP);
   pinMode(TACHO_FLOW, INPUT_PULLUP);
-  pinMode(13, OUTPUT);
+  pinMode(13, OUTPUT); // LED...
   
+  // RPM counting: Increment counter in PinChangeInterrupt on rising edge
   attachPCINT(digitalPinToPCINT(TACHO_PUMP), []() { intTachoPumpCounter++; }, RISING);
   attachPCINT(digitalPinToPCINT(TACHO_FLOW), []() { intTachoFlowCounter++; }, RISING);
+  // RPM counting: In Timer1 interrupt copy&reset Counters every second
   Timer1.initialize(1000000);
   Timer1.attachInterrupt([]() {
     static uint8_t ledState = 0;
     ledState = !ledState;
-    digitalWrite(13, ledState?LOW:HIGH);
+    digitalWrite(13, ledState?LOW:HIGH); // LED only for debug, can be turned off
     intTachoPumpVal = intTachoPumpCounter; intTachoPumpCounter = 0;
     intTachoFlowVal = intTachoFlowCounter; intTachoFlowCounter = 0;
   }); 
 
+  // Activate watchdog. Needs Optiboot bootloader! Otherwise endless watchdog-reset.
   wdt_reset();
   wdt_enable(WDTO_4S); // 4s / System Reset
 
+  // Init OLED. For extra long cable to Laser-Front the 10k I2C resistors has been changed by 1k on OLED
   u8g2.setBusClock(100000); // make it slow for long cable
   u8g2.begin();
   //u8g2.setFlipMode(0);
@@ -115,12 +111,12 @@ void setup(void) {
   u8g2.setFontPosTop();
   u8g2.setFontDirection(0);
 
+  // One-wire bus with temperature sensors here
   tempSensors.begin();
   tempSensors.setResolution(tempSensLaserTube, TEMPERATURE_PRECISION);
   tempSensors.setResolution(tempSensWaterIn, TEMPERATURE_PRECISION);
   tempSensors.setResolution(tempSensWaterOut, TEMPERATURE_PRECISION);
   printSensorAddresses();
-
 
 }
 
@@ -128,6 +124,7 @@ void setup(void) {
 // function to print device addresses
 void printSensorAddresses()
 {
+  // Uncomment the following block to print out your device adresses
   /*
   int devCount = tempSensors.getDeviceCount();
   Serial.print("#devices: ");
@@ -153,50 +150,53 @@ void printSensorAddresses()
 }
 
 
-
+// Static common buffer used for sprintf
 char sbuf[50];
 
+// Nominator and Denominator for calibration (30000V or 30000uA equals ADC value 613)
 #define C_NOM   (uint32_t)(30000UL)
 #define C_DENOM (uint32_t)(613)
 #define V_NOM   (uint32_t)(30000UL)
 #define V_DENOM (uint32_t)(613)
 
 void loop(void) {
-  // Read sensors
+  // Read sensors, takes longer if resolution is set high
   tempSensors.requestTemperatures();
   tempLaserTube = tempSensors.getTempC(tempSensLaserTube);
   tempWaterIn   = tempSensors.getTempC(tempSensWaterIn);
   tempWaterOut  = tempSensors.getTempC(tempSensWaterOut);
 
+  // Make copy to avoid that value gets overwritten when accessed
   noInterrupts();
   TachoPumpVal = intTachoPumpVal;
   TachoFlowVal = intTachoFlowVal;
   interrupts();
 
+  // get ADC value
   laserVoltageADC = analogRead(LASER_VOLTAGE); // 3.00V = 613
   laserCurrentADC = analogRead(LASER_CURRENT);
   
+  // calculate physical values
   laserCurrentuA = (((uint32_t)laserCurrentADC * C_NOM) / C_DENOM);
   laserVoltageV  = (((uint32_t)laserVoltageADC * V_NOM) / V_DENOM);
   laser_kV = laserVoltageV / 1000.0;
   laser_mA = laserCurrentuA / 1000.0;
 
+  // print out all data in one long line via serial
   Serial.print(tempLaserTube,2);
-  Serial.print(", ");
+  Serial.print(F(", "));
   Serial.print(tempWaterIn,2);
-  Serial.print(", ");
+  Serial.print(F(", "));
   Serial.print(tempWaterOut,2);
 
-  Serial.print(" | ");
-  
+  Serial.print(F(" | "));
   Serial.print(TachoFlowVal);
-  Serial.print(", ");
+  Serial.print(F(", "));
   Serial.print(TachoPumpVal); 
 
-  Serial.print(" | ");
-
+  Serial.print(F(" | "));
   Serial.print(laserCurrentADC);
-  Serial.print(", ");
+  Serial.print(F(", "));
   Serial.println(laserVoltageADC);
 
   // picture loop  
@@ -206,6 +206,7 @@ void loop(void) {
 
   u8g2.firstPage();  
   do {
+    // This draws all data on the display ### NOT NICE FORMATED YET ####
     u8g2.drawStr( 0, 0, "Tube In Out ");
     sprintf_P(sbuf, PSTR("%0.1f °C, %0.1f °C, %0.1f °C"), tempLaserTube, tempWaterIn, tempWaterOut);
     u8g2.drawUTF8(0, 10, sbuf);
@@ -218,13 +219,9 @@ void loop(void) {
     sprintf_P(sbuf, PSTR("%d Flow, %d Pump"), TachoFlowVal, TachoPumpVal);
     u8g2.drawUTF8(0, 50, sbuf);
   } while ( u8g2.nextPage() );
-  // u8g2.updateDisplay();
-  // u8g2.sendBuffer();
-  
-
 
   // delay between each page
-  delay(150);
+  // delay(150); // nonsense, slow enough anyways...
 
   wdt_reset();
 }
