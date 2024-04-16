@@ -14,6 +14,7 @@
 
 */
 
+// unclear if those .._ENABLE_... defines work if placed here...
 #define PCINT_ENABLE_MANUAL
 #define PCINT_ENABLE_PORT0
 #define PCINT_ENABLE_PCINT2
